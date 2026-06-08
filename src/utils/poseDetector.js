@@ -1,22 +1,37 @@
-import * as tf from '@tensorflow/tfjs'
-import * as poseDetection from '@tensorflow-models/pose-detection'
-
 let detector = null
+let modelPromise = null
 
 export async function loadModel() {
   if (detector) return detector
+  // Cache the in-flight promise so concurrent callers (e.g. a double-click)
+  // share one createDetector call instead of building duplicate detectors.
+  if (modelPromise) return modelPromise
 
-  await tf.ready()
+  modelPromise = (async () => {
+    // Dynamic import keeps the ~2.4 MB TensorFlow.js bundle out of the initial
+    // page load — it is only fetched once the user starts an analysis.
+    const tf = await import('@tensorflow/tfjs')
+    const poseDetection = await import('@tensorflow-models/pose-detection')
 
-  detector = await poseDetection.createDetector(
-    poseDetection.SupportedModels.MoveNet,
-    {
-      modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
-      enableSmoothing: false,
-    }
-  )
+    await tf.ready()
 
-  return detector
+    detector = await poseDetection.createDetector(
+      poseDetection.SupportedModels.MoveNet,
+      {
+        modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+        enableSmoothing: false,
+      }
+    )
+    return detector
+  })()
+
+  try {
+    return await modelPromise
+  } catch (err) {
+    // Reset so a later attempt can retry instead of being stuck on a rejected promise.
+    modelPromise = null
+    throw err
+  }
 }
 
 export async function detectPoseFromCanvas(canvas) {

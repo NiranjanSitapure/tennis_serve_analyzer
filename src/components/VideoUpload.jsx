@@ -2,18 +2,27 @@ import { useRef, useState } from 'react'
 
 export default function VideoUpload({ onVideoSelect, videoFile, videoUrl, onAnalyze }) {
   const [dragging, setDragging] = useState(false)
+  const [error, setError] = useState('')
   const fileInputRef = useRef(null)
+
+  function selectFile(file) {
+    if (!file) return
+    if (!file.type.startsWith('video/')) {
+      setError('That doesn\'t look like a video file. Please choose an MP4, MOV, or other video format.')
+      return
+    }
+    setError('')
+    onVideoSelect(file)
+  }
 
   function handleDrop(e) {
     e.preventDefault()
     setDragging(false)
-    const file = e.dataTransfer.files[0]
-    if (file && file.type.startsWith('video/')) onVideoSelect(file)
+    selectFile(e.dataTransfer.files[0])
   }
 
   function handleChange(e) {
-    const file = e.target.files[0]
-    if (file) onVideoSelect(file)
+    selectFile(e.target.files[0])
     e.target.value = ''
   }
 
@@ -51,6 +60,9 @@ export default function VideoUpload({ onVideoSelect, videoFile, videoUrl, onAnal
             className="hidden"
             onChange={handleChange}
           />
+          {error && (
+            <p className="text-red-400 text-sm mt-4">{error}</p>
+          )}
         </div>
       ) : (
         <div className="space-y-5">

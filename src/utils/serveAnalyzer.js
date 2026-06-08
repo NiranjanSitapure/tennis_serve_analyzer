@@ -11,23 +11,44 @@ const KP = {
   LEFT_ANKLE: 15, RIGHT_ANKLE: 16,
 }
 
+// MoveNet emits ~0.7+ for clearly visible joints and <0.2 for occluded ones.
+// 0.4 keeps confident detections while rejecting noisy, badly-positioned ones.
+const MIN_CONFIDENCE = 0.4
+
 function kp(pose, idx) {
   if (!pose || !pose.keypoints) return null
   const p = pose.keypoints[idx]
-  return p && p.score > 0.25 ? p : null
+  return p && p.score > MIN_CONFIDENCE ? p : null
 }
 
 function dist(a, b) {
   if (!a || !b) return null
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+  return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
-function elbowAngle(shoulder, elbow, wrist) {
-  if (!shoulder || !elbow || !wrist) return null
-  const ab = { x: shoulder.x - elbow.x, y: shoulder.y - elbow.y }
-  const cb = { x: wrist.x - elbow.x, y: wrist.y - elbow.y }
-  const dot = ab.x * cb.x + ab.y * cb.y
-  const mag = Math.sqrt(ab.x ** 2 + ab.y ** 2) * Math.sqrt(cb.x ** 2 + cb.y ** 2)
+function midpoint(a, b) {
+  if (a && b) return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+  return a || b || null
+}
+
+// Torso length (shoulder midpoint → hip midpoint) gives a body-relative unit so
+// thresholds stay consistent whether the clip is 480p or 4K. All distance
+// comparisons below are expressed as fractions of this scale (T).
+function bodyScale(pose) {
+  const sh = midpoint(kp(pose, KP.LEFT_SHOULDER), kp(pose, KP.RIGHT_SHOULDER))
+  const hp = midpoint(kp(pose, KP.LEFT_HIP), kp(pose, KP.RIGHT_HIP))
+  const d = dist(sh, hp)
+  return d && d > 1 ? d : null
+}
+
+// Interior angle (degrees) at `vertex` formed by points a–vertex–c.
+// Angle-based metrics are inherently resolution-independent.
+function jointAngle(a, vertex, c) {
+  if (!a || !vertex || !c) return null
+  const v1 = { x: a.x - vertex.x, y: a.y - vertex.y }
+  const v2 = { x: c.x - vertex.x, y: c.y - vertex.y }
+  const dot = v1.x * v2.x + v1.y * v2.y
+  const mag = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y)
   if (mag === 0) return null
   return Math.acos(Math.max(-1, Math.min(1, dot / mag))) * (180 / Math.PI)
 }
@@ -38,8 +59,14 @@ function status(score) {
   return 'poor'
 }
 
-// Detect which arm is the serving arm (the one that reaches highest in the video).
-// In image coords y increases downward, so minimum y = highest point.
+function uncertain(name, message) {
+  return { name, score: 60, status: 'uncertain', feedback: [message] }
+}
+
+// Detect the serving arm as the one whose wrist reaches the highest point
+// (minimum y, since y increases downward) across the analyzed frames.
+// Only confident detections count; falls back to right-handed if neither
+// wrist is ever detected.
 function detectServingArm(poses) {
   let leftMin = Infinity, rightMin = Infinity
   for (const pose of poses) {
@@ -49,31 +76,38 @@ function detectServingArm(poses) {
     if (lw) leftMin = Math.min(leftMin, lw.y)
     if (rw) rightMin = Math.min(rightMin, rw.y)
   }
+  if (leftMin === Infinity && rightMin === Infinity) return 'right'
   return rightMin < leftMin ? 'right' : 'left'
 }
 
 function analyzeStance(pose, servingArm) {
-  const ankle = kp(pose, servingArm === 'right' ? KP.RIGHT_ANKLE : KP.LEFT_ANKLE)
-  const oppAnkle = kp(pose, servingArm === 'right' ? KP.LEFT_ANKLE : KP.RIGHT_ANKLE)
-  const shoulder = kp(pose, KP.LEFT_SHOULDER)
-  const oppShoulder = kp(pose, KP.RIGHT_SHOULDER)
+  const T = bodyScale(pose)
+  const lAnkle = kp(pose, KP.LEFT_ANKLE)
+  const rAnkle = kp(pose, KP.RIGHT_ANKLE)
+  const lShoulder = kp(pose, KP.LEFT_SHOULDER)
+  const rShoulder = kp(pose, KP.RIGHT_SHOULDER)
 
-  if (!ankle || !oppAnkle) {
+  if (!lAnkle || !rAnkle) {
+    return uncertain('Stance', 'Could not clearly detect both feet — record with your full body in frame from the front')
+  }
+  if (!T || !lShoulder || !rShoulder) {
+    return uncertain('Stance', 'Feet detected but could not measure stance relative to your body size')
+  }
+
+  const shoulderWidth = Math.abs(lShoulder.x - rShoulder.x)
+
+  // From a side/angled view the shoulders project narrow and the feet line up
+  // along the camera's depth axis, so horizontal stance width is meaningless.
+  if (shoulderWidth < 0.5 * T) {
     return {
       name: 'Stance',
-      score: 60,
+      score: 65,
       status: 'uncertain',
-      feedback: ['Could not clearly detect foot position — try recording with your full body in frame from the side or front'],
+      feedback: ['Looks like a side-view angle — stance width can\'t be measured reliably from here. Record from the front to score your stance.'],
     }
   }
 
-  const feetWidth = Math.abs(ankle.x - oppAnkle.x)
-  const shoulderWidth = shoulder && oppShoulder ? Math.abs(shoulder.x - oppShoulder.x) : null
-
-  if (!shoulderWidth) {
-    return { name: 'Stance', score: 65, status: 'needs_work', feedback: ['Feet detected but could not measure stance relative to shoulder width'] }
-  }
-
+  const feetWidth = Math.abs(lAnkle.x - rAnkle.x)
   const ratio = feetWidth / shoulderWidth
   const pct = Math.round(ratio * 100)
 
@@ -87,61 +121,85 @@ function analyzeStance(pose, servingArm) {
 }
 
 function analyzeBallToss(pose, servingArm) {
-  // Tossing arm is opposite to serving arm
+  const T = bodyScale(pose)
+  // Tossing arm is opposite the serving arm
   const tossingWrist = kp(pose, servingArm === 'right' ? KP.LEFT_WRIST : KP.RIGHT_WRIST)
   const nose = kp(pose, KP.NOSE)
   const tossShoulder = kp(pose, servingArm === 'right' ? KP.LEFT_SHOULDER : KP.RIGHT_SHOULDER)
 
   if (!tossingWrist) {
-    return { name: 'Ball Toss', score: 55, status: 'uncertain', feedback: ['Could not detect tossing hand — make sure your full body is visible throughout the serve'] }
+    return uncertain('Ball Toss', 'Could not detect the tossing hand — keep your whole body visible throughout the serve')
+  }
+  if (!T) {
+    return uncertain('Ball Toss', 'Detected the tossing hand but could not gauge your body size to judge toss height')
   }
 
-  // y increases downward: lower y value = higher position in frame
-  if (nose && tossingWrist.y < nose.y - 10) {
-    const extended = tossShoulder && tossingWrist.y < tossShoulder.y - 80
-    const score = extended ? 92 : 82
-    const msg = extended
-      ? 'Excellent ball toss — arm fully extended above head height for a clean release'
-      : 'Good toss height — wrist is above head level'
-    return { name: 'Ball Toss', score, status: 'good', feedback: [msg] }
-  } else if (nose && tossingWrist.y < nose.y + 40) {
-    return { name: 'Ball Toss', score: 65, status: 'needs_work', feedback: ['Toss height is borderline — aim to release with your arm fully extended above your head for more control'] }
-  } else {
+  if (nose) {
+    if (tossingWrist.y < nose.y - 0.05 * T) {
+      const extended = tossShoulder && tossingWrist.y < tossShoulder.y - 0.5 * T
+      return {
+        name: 'Ball Toss',
+        score: extended ? 92 : 82,
+        status: 'good',
+        feedback: [extended
+          ? 'Excellent ball toss — arm fully extended above head height for a clean release'
+          : 'Good toss height — wrist is above head level'],
+      }
+    } else if (tossingWrist.y < nose.y + 0.2 * T) {
+      return { name: 'Ball Toss', score: 65, status: 'needs_work', feedback: ['Toss height is borderline — aim to release with your arm fully extended above your head for more control'] }
+    }
     return { name: 'Ball Toss', score: 42, status: 'poor', feedback: ['Toss appears low — extend your arm completely and release the ball at the peak of your reach to give yourself time to prepare'] }
   }
+
+  // No head reference — fall back to judging the wrist against the shoulder
+  if (tossShoulder) {
+    if (tossingWrist.y < tossShoulder.y - 0.3 * T) {
+      return { name: 'Ball Toss', score: 80, status: 'good', feedback: ['Good toss height — tossing arm is well raised above the shoulder'] }
+    } else if (tossingWrist.y < tossShoulder.y) {
+      return { name: 'Ball Toss', score: 62, status: 'needs_work', feedback: ['Tossing arm is only slightly raised — extend it fully above your head for a higher, more controlled toss'] }
+    }
+    return { name: 'Ball Toss', score: 45, status: 'poor', feedback: ['Tossing arm appears low — reach up and release the ball at full extension above your head'] }
+  }
+
+  return uncertain('Ball Toss', 'Could not find a head or shoulder reference to judge toss height — try a clearer, well-lit recording')
 }
 
 function analyzeTrophyPosition(pose, servingArm) {
+  const T = bodyScale(pose)
   const elbow = kp(pose, servingArm === 'right' ? KP.RIGHT_ELBOW : KP.LEFT_ELBOW)
   const shoulder = kp(pose, servingArm === 'right' ? KP.RIGHT_SHOULDER : KP.LEFT_SHOULDER)
   const knee = kp(pose, servingArm === 'right' ? KP.RIGHT_KNEE : KP.LEFT_KNEE)
   const hip = kp(pose, servingArm === 'right' ? KP.RIGHT_HIP : KP.LEFT_HIP)
+  const ankle = kp(pose, servingArm === 'right' ? KP.RIGHT_ANKLE : KP.LEFT_ANKLE)
 
   if (!elbow || !shoulder) {
-    return { name: 'Trophy Position', score: 55, status: 'uncertain', feedback: ['Could not detect serving arm position in the trophy frame'] }
+    return uncertain('Trophy Position', 'Could not detect the serving arm in the trophy frame')
+  }
+  if (!T) {
+    return uncertain('Trophy Position', 'Detected the serving arm but could not gauge your body size')
   }
 
   const feedback = []
   let score = 70
 
-  // Elbow above shoulder (lower y = higher in image)
+  // Racket elbow vs shoulder (lower y = higher in frame)
   if (elbow.y < shoulder.y) {
     score += 15
     feedback.push('Good racket arm position — elbow is above shoulder level, creating the classic trophy shape')
-  } else if (elbow.y < shoulder.y + 20) {
+  } else if (elbow.y < shoulder.y + 0.1 * T) {
     feedback.push('Racket elbow is close to shoulder height — try to raise it slightly higher for a better trophy position')
   } else {
     score -= 15
     feedback.push('Racket elbow appears below shoulder level — raise your elbow to at least shoulder height to form the trophy position')
   }
 
-  // Knee bend
-  if (knee && hip) {
-    const bend = knee.y - hip.y
-    if (bend > 50) {
+  // Knee bend measured by the hip–knee–ankle angle (180° = straight legs).
+  const kneeAngle = jointAngle(hip, knee, ankle)
+  if (kneeAngle !== null) {
+    if (kneeAngle < 150) {
       score += 10
       feedback.push('Nice knee bend — leg drive will add significant power to your serve')
-    } else if (bend > 25) {
+    } else if (kneeAngle < 165) {
       feedback.push('Some knee bend detected — try bending a bit more to maximize leg drive')
     } else {
       score -= 10
@@ -154,31 +212,39 @@ function analyzeTrophyPosition(pose, servingArm) {
 }
 
 function analyzeContact(pose, servingArm) {
+  const T = bodyScale(pose)
   const wrist = kp(pose, servingArm === 'right' ? KP.RIGHT_WRIST : KP.LEFT_WRIST)
   const elbow = kp(pose, servingArm === 'right' ? KP.RIGHT_ELBOW : KP.LEFT_ELBOW)
   const shoulder = kp(pose, servingArm === 'right' ? KP.RIGHT_SHOULDER : KP.LEFT_SHOULDER)
   const nose = kp(pose, KP.NOSE)
 
   if (!wrist) {
-    return { name: 'Contact Point', score: 55, status: 'uncertain', feedback: ['Could not detect racket hand position at contact frame'] }
+    return uncertain('Contact Point', 'Could not detect the racket hand at the contact frame')
+  }
+  if (!T) {
+    return uncertain('Contact Point', 'Detected the racket hand but could not gauge your body size')
   }
 
   const feedback = []
   let score = 65
 
-  // Wrist height: should be above head
-  if (nose && wrist.y < nose.y - 5) {
-    score += 18
-    feedback.push('Good contact height — racket is making contact above head level')
-  } else if (nose && wrist.y < nose.y + 20) {
-    feedback.push('Contact height is near head level — aim to reach higher for more power and a better angle over the net')
+  // Contact height — should be above the head
+  if (nose) {
+    if (wrist.y < nose.y - 0.05 * T) {
+      score += 18
+      feedback.push('Good contact height — racket is making contact above head level')
+    } else if (wrist.y < nose.y + 0.15 * T) {
+      feedback.push('Contact height is near head level — aim to reach higher for more power and a better angle over the net')
+    } else {
+      score -= 15
+      feedback.push('Contact point appears low — reach up to strike the ball above your head for maximum power and clearance')
+    }
   } else {
-    score -= 15
-    feedback.push('Contact point appears low — reach up to strike the ball above your head for maximum power and clearance')
+    feedback.push('Could not find a head reference to judge contact height — scored on arm extension only')
   }
 
-  // Arm extension at contact
-  const angle = elbowAngle(shoulder, elbow, wrist)
+  // Arm extension at contact (shoulder–elbow–wrist angle)
+  const angle = jointAngle(shoulder, elbow, wrist)
   if (angle !== null) {
     if (angle > 155) {
       score += 15
@@ -197,27 +263,27 @@ function analyzeContact(pose, servingArm) {
 }
 
 function analyzeFollowThrough(pose, servingArm) {
+  const T = bodyScale(pose)
   const wrist = kp(pose, servingArm === 'right' ? KP.RIGHT_WRIST : KP.LEFT_WRIST)
   const hip = kp(pose, servingArm === 'right' ? KP.RIGHT_HIP : KP.LEFT_HIP)
   const oppHip = kp(pose, servingArm === 'right' ? KP.LEFT_HIP : KP.RIGHT_HIP)
 
   if (!wrist) {
-    return { name: 'Follow-Through', score: 55, status: 'uncertain', feedback: ['Could not detect follow-through position clearly'] }
+    return uncertain('Follow-Through', 'Could not detect the follow-through position clearly')
   }
 
-  if (hip && oppHip) {
+  if (hip && oppHip && T) {
     const midX = (hip.x + oppHip.x) / 2
-    // Serving arm should cross to opposite side
+    // Serving arm should cross to the opposite side of the body
     const crossed = servingArm === 'right' ? wrist.x < midX : wrist.x > midX
     const distFromMid = Math.abs(wrist.x - midX)
 
     if (crossed) {
       return { name: 'Follow-Through', score: 90, status: 'good', feedback: ['Complete follow-through — racket arm has crossed the body correctly, promoting spin and control'] }
-    } else if (distFromMid < 40) {
+    } else if (distFromMid < 0.25 * T) {
       return { name: 'Follow-Through', score: 68, status: 'needs_work', feedback: ['Follow-through almost complete — let the racket continue swinging fully across your body to the opposite hip'] }
-    } else {
-      return { name: 'Follow-Through', score: 48, status: 'poor', feedback: ['Incomplete follow-through — allow the racket to swing naturally all the way across your body. Stopping early reduces spin and increases injury risk'] }
     }
+    return { name: 'Follow-Through', score: 48, status: 'poor', feedback: ['Incomplete follow-through — allow the racket to swing naturally all the way across your body. Stopping early reduces spin and increases injury risk'] }
   }
 
   return { name: 'Follow-Through', score: 65, status: 'needs_work', feedback: ['Follow-through detected — ensure the racket swings completely across your body toward the opposite hip for maximum spin and safety'] }

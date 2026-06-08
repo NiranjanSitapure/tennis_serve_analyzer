@@ -4,7 +4,7 @@ const STEPS = [
   { label: 'Analyzing form', desc: 'Scoring each phase of your serve technique' },
 ]
 
-export default function AnalysisProgress({ progress }) {
+export default function AnalysisProgress({ progress, onCancel }) {
   return (
     <div className="py-20 flex flex-col items-center text-center">
       <div className="text-6xl mb-6 animate-spin-slow">🎾</div>
@@ -44,6 +44,15 @@ export default function AnalysisProgress({ progress }) {
       <p className="text-gray-600 text-xs mt-10">
         First run downloads the AI model (~5 MB) and may take 10–20 seconds
       </p>
+
+      {onCancel && (
+        <button
+          onClick={onCancel}
+          className="mt-6 text-sm text-gray-400 hover:text-white border border-gray-600 hover:border-gray-400 px-5 py-2 rounded-lg transition-colors"
+        >
+          Cancel
+        </button>
+      )}
     </div>
   )
 }
