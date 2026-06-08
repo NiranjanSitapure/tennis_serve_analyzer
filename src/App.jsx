@@ -20,6 +20,8 @@ export default function App() {
 
   // Keep canvas references separate from React state to avoid serialization issues
   const canvasesRef = useRef([])
+  // Set when the user cancels; checked between async steps to abort early.
+  const cancelRef = useRef(false)
 
   function handleVideoSelect(file) {
     setVideoFile(file)
@@ -35,6 +37,7 @@ export default function App() {
 
   async function runAnalysis() {
     if (!videoFile) return
+    cancelRef.current = false
     setStatus('analyzing')
     setErrorMsg('')
 
@@ -42,6 +45,7 @@ export default function App() {
       // Step 1 — extract frames
       setProgress({ step: 0, message: 'Extracting key frames from video...' })
       const extracted = await extractFrames(videoFile)
+      if (cancelRef.current) return
 
       canvasesRef.current = extracted.map(f => f.canvas)
       // Store display-only data in state (canvas excluded to keep state serializable)
@@ -50,12 +54,14 @@ export default function App() {
       // Step 2 — load model
       setProgress({ step: 1, message: 'Loading AI model (first run may take ~15 s)...' })
       await loadModel()
+      if (cancelRef.current) return
 
       // Step 3 — detect poses frame by frame
       const detected = []
       for (let i = 0; i < canvasesRef.current.length; i++) {
         setProgress({ step: 1, message: `Detecting pose — frame ${i + 1} of ${canvasesRef.current.length}` })
         const pose = await detectPoseFromCanvas(canvasesRef.current[i])
+        if (cancelRef.current) return
         detected.push(pose)
       }
       setPoses(detected)
@@ -67,10 +73,20 @@ export default function App() {
 
       setStatus('results')
     } catch (err) {
+      if (cancelRef.current) return
       console.error('Analysis error:', err)
       setErrorMsg(err.message || 'Analysis failed. Please try again with a different video.')
       setStatus('error')
     }
+  }
+
+  function cancelAnalysis() {
+    cancelRef.current = true
+    setFrames([])
+    setPoses([])
+    setAnalysis(null)
+    canvasesRef.current = []
+    setStatus('idle')
   }
 
   function reset() {
@@ -119,7 +135,7 @@ export default function App() {
         )}
 
         {status === 'analyzing' && (
-          <AnalysisProgress progress={progress} />
+          <AnalysisProgress progress={progress} onCancel={cancelAnalysis} />
         )}
 
         {status === 'error' && (

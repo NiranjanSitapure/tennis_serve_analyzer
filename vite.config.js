@@ -6,12 +6,7 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          tensorflow: ['@tensorflow/tfjs', '@tensorflow-models/pose-detection'],
-        },
-      },
-    },
+    // TensorFlow.js is split into its own chunk automatically via the dynamic
+    // import() in src/utils/poseDetector.js — no manual chunking needed.
   },
 })

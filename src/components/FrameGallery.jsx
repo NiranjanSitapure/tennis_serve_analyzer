@@ -10,10 +10,15 @@ function FrameCard({ frame, pose, index }) {
     const canvas = canvasRef.current
     if (!canvas || !frame?.dataUrl) return
 
+    let cancelled = false
     const ctx = canvas.getContext('2d')
     const img = new Image()
 
     img.onload = () => {
+      // A re-render (new frame/pose) or unmount may have happened while the
+      // image decoded — bail so we don't paint stale data on the canvas.
+      if (cancelled) return
+
       const aspectRatio = img.height / img.width
       canvas.width = DISPLAY_WIDTH
       canvas.height = Math.round(DISPLAY_WIDTH * aspectRatio)
@@ -28,6 +33,8 @@ function FrameCard({ frame, pose, index }) {
     }
 
     img.src = frame.dataUrl
+
+    return () => { cancelled = true }
   }, [frame?.dataUrl, pose])
 
   const confidence = pose
