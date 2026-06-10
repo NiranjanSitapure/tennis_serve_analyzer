@@ -1,7 +1,7 @@
 const TARGET_FPS = 10        // sample rate across the whole clip
 const MIN_FRAMES = 8         // never extract fewer than this
-const MAX_FRAMES = 40        // cap to bound analysis time on long clips
-const EXTRACT_MAX_DIM = 512  // cap canvas size; BlazePose resizes to ~256px anyway
+const MAX_FRAMES = 20        // MoveNet is fast; 20 frames at 10 FPS = 2 s window, plenty for phase detection
+const EXTRACT_MAX_DIM = 512  // MoveNet resizes input to 256px anyway
 
 const LOAD_TIMEOUT_MS = 30000
 const SEEK_TIMEOUT_MS = 10000

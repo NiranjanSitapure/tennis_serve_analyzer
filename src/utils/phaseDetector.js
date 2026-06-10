@@ -4,21 +4,21 @@
 // `ryanboscobanze/GolfPosePro` (wrist-Y trajectory) extended with serve-
 // specific signals.
 
-// BlazePose landmark indices
-const LEFT_SHOULDER = 11
-const RIGHT_SHOULDER = 12
-const LEFT_ELBOW = 13
-const RIGHT_ELBOW = 14
-const LEFT_WRIST = 15
-const RIGHT_WRIST = 16
-const LEFT_HIP = 23
-const RIGHT_HIP = 24
-const LEFT_KNEE = 25
-const RIGHT_KNEE = 26
-const LEFT_ANKLE = 27
-const RIGHT_ANKLE = 28
+// MoveNet 17-keypoint COCO indices.
+const LEFT_SHOULDER = 5
+const RIGHT_SHOULDER = 6
+const LEFT_ELBOW = 7
+const RIGHT_ELBOW = 8
+const LEFT_WRIST = 9
+const RIGHT_WRIST = 10
+const LEFT_HIP = 11
+const RIGHT_HIP = 12
+const LEFT_KNEE = 13
+const RIGHT_KNEE = 14
+const LEFT_ANKLE = 15
+const RIGHT_ANKLE = 16
 
-const KP_MIN_SCORE = 0.5
+const KP_MIN_SCORE = 0.3
 
 function pt(pose, idx) {
   if (!pose || !pose.keypoints) return null
