@@ -1,56 +1,68 @@
-// MoveNet keypoint indices
+// BlazePose 33-landmark indices (subset used here).
 const KP = {
   NOSE: 0,
-  LEFT_EYE: 1, RIGHT_EYE: 2,
-  LEFT_EAR: 3, RIGHT_EAR: 4,
-  LEFT_SHOULDER: 5, RIGHT_SHOULDER: 6,
-  LEFT_ELBOW: 7, RIGHT_ELBOW: 8,
-  LEFT_WRIST: 9, RIGHT_WRIST: 10,
-  LEFT_HIP: 11, RIGHT_HIP: 12,
-  LEFT_KNEE: 13, RIGHT_KNEE: 14,
-  LEFT_ANKLE: 15, RIGHT_ANKLE: 16,
+  LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
+  LEFT_ELBOW: 13, RIGHT_ELBOW: 14,
+  LEFT_WRIST: 15, RIGHT_WRIST: 16,
+  LEFT_HIP: 23, RIGHT_HIP: 24,
+  LEFT_KNEE: 25, RIGHT_KNEE: 26,
+  LEFT_ANKLE: 27, RIGHT_ANKLE: 28,
 }
 
-// MoveNet emits ~0.7+ for clearly visible joints and <0.2 for occluded ones.
-// 0.4 keeps confident detections while rejecting noisy, badly-positioned ones.
-const MIN_CONFIDENCE = 0.4
+// BlazePose visibility scores tend to be high (>0.8) for clearly visible
+// joints; 0.5 gates out fully occluded ones without being so strict it
+// discards usable signal.
+const MIN_CONFIDENCE = 0.5
 
-function kp(pose, idx) {
+// ----------------------------------------------------------------------------
+// Keypoint accessors
+// ----------------------------------------------------------------------------
+
+// 2D image-space keypoint (px). Returns null when occluded or off-frame.
+function kp2D(pose, idx) {
   if (!pose || !pose.keypoints) return null
   const p = pose.keypoints[idx]
   return p && p.score > MIN_CONFIDENCE ? p : null
 }
 
-function dist(a, b) {
+// 3D hip-centered world-space keypoint (meters). BlazePose centers the
+// coordinate system at the midpoint of the hips, so x/y/z are body-relative
+// and camera-angle independent. Returns null when not detected.
+function kp3D(pose, idx) {
+  if (!pose || !pose.keypoints3D) return null
+  const p = pose.keypoints3D[idx]
+  if (!p) return null
+  // BlazePose 3D keypoints don't always carry a meaningful score; trust the
+  // matching 2D keypoint's score as the visibility proxy.
+  const score = (pose.keypoints && pose.keypoints[idx] && pose.keypoints[idx].score) || 0
+  return score > MIN_CONFIDENCE ? p : null
+}
+
+function dist3D(a, b) {
+  if (!a || !b) return null
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z)
+}
+
+function dist2D(a, b) {
   if (!a || !b) return null
   return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
-function midpoint(a, b) {
-  if (a && b) return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
-  return a || b || null
-}
-
-// Torso length (shoulder midpoint → hip midpoint) gives a body-relative unit so
-// thresholds stay consistent whether the clip is 480p or 4K. All distance
-// comparisons below are expressed as fractions of this scale (T).
-function bodyScale(pose) {
-  const sh = midpoint(kp(pose, KP.LEFT_SHOULDER), kp(pose, KP.RIGHT_SHOULDER))
-  const hp = midpoint(kp(pose, KP.LEFT_HIP), kp(pose, KP.RIGHT_HIP))
-  const d = dist(sh, hp)
-  return d && d > 1 ? d : null
-}
-
-// Interior angle (degrees) at `vertex` formed by points a–vertex–c.
-// Angle-based metrics are inherently resolution-independent.
-function jointAngle(a, vertex, c) {
+// Interior angle (degrees) at `vertex` formed by points a–vertex–c. Works in
+// 2D or 3D — we always pass 3D where possible since projection foreshortening
+// can collapse a real joint angle.
+function jointAngle3D(a, vertex, c) {
   if (!a || !vertex || !c) return null
-  const v1 = { x: a.x - vertex.x, y: a.y - vertex.y }
-  const v2 = { x: c.x - vertex.x, y: c.y - vertex.y }
-  const dot = v1.x * v2.x + v1.y * v2.y
-  const mag = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y)
+  const v1x = a.x - vertex.x, v1y = a.y - vertex.y, v1z = (a.z ?? 0) - (vertex.z ?? 0)
+  const v2x = c.x - vertex.x, v2y = c.y - vertex.y, v2z = (c.z ?? 0) - (vertex.z ?? 0)
+  const dot = v1x * v2x + v1y * v2y + v1z * v2z
+  const mag = Math.hypot(v1x, v1y, v1z) * Math.hypot(v2x, v2y, v2z)
   if (mag === 0) return null
   return Math.acos(Math.max(-1, Math.min(1, dot / mag))) * (180 / Math.PI)
+}
+
+function clamp(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v))
 }
 
 function status(score) {
@@ -63,51 +75,33 @@ function uncertain(name, message) {
   return { name, score: 60, status: 'uncertain', feedback: [message] }
 }
 
-// Detect the serving arm as the one whose wrist reaches the highest point
-// (minimum y, since y increases downward) across the analyzed frames.
-// Only confident detections count; falls back to right-handed if neither
-// wrist is ever detected.
-function detectServingArm(poses) {
-  let leftMin = Infinity, rightMin = Infinity
-  for (const pose of poses) {
-    if (!pose) continue
-    const lw = kp(pose, KP.LEFT_WRIST)
-    const rw = kp(pose, KP.RIGHT_WRIST)
-    if (lw) leftMin = Math.min(leftMin, lw.y)
-    if (rw) rightMin = Math.min(rightMin, rw.y)
-  }
-  if (leftMin === Infinity && rightMin === Infinity) return 'right'
-  return rightMin < leftMin ? 'right' : 'left'
-}
+// ----------------------------------------------------------------------------
+// Per-phase scoring — each phase receives the SINGLE pose at its chosen frame.
+// Returns { name, score, status, feedback } same shape as before so the UI
+// keeps working unchanged.
+// ----------------------------------------------------------------------------
 
-function analyzeStance(pose, servingArm) {
-  const T = bodyScale(pose)
-  const lAnkle = kp(pose, KP.LEFT_ANKLE)
-  const rAnkle = kp(pose, KP.RIGHT_ANKLE)
-  const lShoulder = kp(pose, KP.LEFT_SHOULDER)
-  const rShoulder = kp(pose, KP.RIGHT_SHOULDER)
+function analyzeStance(pose, handedness) {
+  if (!pose) return uncertain('Stance', 'Could not pick a stable stance frame — try a video where you set up clearly before the toss')
 
-  if (!lAnkle || !rAnkle) {
-    return uncertain('Stance', 'Could not clearly detect both feet — record with your full body in frame from the front')
-  }
-  if (!T || !lShoulder || !rShoulder) {
-    return uncertain('Stance', 'Feet detected but could not measure stance relative to your body size')
+  // Use 3D world coords for camera-invariant stance width measurement.
+  const lAnkle3 = kp3D(pose, KP.LEFT_ANKLE)
+  const rAnkle3 = kp3D(pose, KP.RIGHT_ANKLE)
+  const lShoulder3 = kp3D(pose, KP.LEFT_SHOULDER)
+  const rShoulder3 = kp3D(pose, KP.RIGHT_SHOULDER)
+
+  if (!lAnkle3 || !rAnkle3 || !lShoulder3 || !rShoulder3) {
+    return uncertain('Stance', 'Could not clearly detect both feet and shoulders — keep your full body in frame')
   }
 
-  const shoulderWidth = Math.abs(lShoulder.x - rShoulder.x)
+  // 3D Euclidean distance in meters. Stance width is camera-angle independent.
+  const feetWidth = dist3D(lAnkle3, rAnkle3)
+  const shoulderWidth = dist3D(lShoulder3, rShoulder3)
 
-  // From a side/angled view the shoulders project narrow and the feet line up
-  // along the camera's depth axis, so horizontal stance width is meaningless.
-  if (shoulderWidth < 0.5 * T) {
-    return {
-      name: 'Stance',
-      score: 65,
-      status: 'uncertain',
-      feedback: ['Looks like a side-view angle — stance width can\'t be measured reliably from here. Record from the front to score your stance.'],
-    }
+  if (!feetWidth || !shoulderWidth || shoulderWidth < 0.05) {
+    return uncertain('Stance', 'Could not measure stance reliably — try a clearer recording')
   }
 
-  const feetWidth = Math.abs(lAnkle.x - rAnkle.x)
   const ratio = feetWidth / shoulderWidth
   const pct = Math.round(ratio * 100)
 
@@ -120,23 +114,23 @@ function analyzeStance(pose, servingArm) {
   }
 }
 
-function analyzeBallToss(pose, servingArm) {
-  const T = bodyScale(pose)
-  // Tossing arm is opposite the serving arm
-  const tossingWrist = kp(pose, servingArm === 'right' ? KP.LEFT_WRIST : KP.RIGHT_WRIST)
-  const nose = kp(pose, KP.NOSE)
-  const tossShoulder = kp(pose, servingArm === 'right' ? KP.LEFT_SHOULDER : KP.RIGHT_SHOULDER)
+function analyzeBallToss(pose, handedness) {
+  if (!pose) return uncertain('Ball Toss', 'Could not pinpoint the ball-toss release frame in this clip')
 
-  if (!tossingWrist) {
-    return uncertain('Ball Toss', 'Could not detect the tossing hand — keep your whole body visible throughout the serve')
-  }
-  if (!T) {
-    return uncertain('Ball Toss', 'Detected the tossing hand but could not gauge your body size to judge toss height')
-  }
+  const tossWristIdx = handedness === 'right' ? KP.LEFT_WRIST : KP.RIGHT_WRIST
+  const tossShoulderIdx = handedness === 'right' ? KP.LEFT_SHOULDER : KP.RIGHT_SHOULDER
 
-  if (nose) {
-    if (tossingWrist.y < nose.y - 0.05 * T) {
-      const extended = tossShoulder && tossingWrist.y < tossShoulder.y - 0.5 * T
+  const wrist3 = kp3D(pose, tossWristIdx)
+  const shoulder3 = kp3D(pose, tossShoulderIdx)
+  const nose3 = kp3D(pose, KP.NOSE)
+
+  if (!wrist3) return uncertain('Ball Toss', 'Could not detect the tossing hand — keep your whole body visible throughout the serve')
+
+  // In BlazePose 3D coords, y INCREASES downward like image space. Smaller y = higher up.
+  if (nose3) {
+    // ~5 cm above the nose is a clean release; ~50 cm = fully extended.
+    if (wrist3.y < nose3.y - 0.05) {
+      const extended = shoulder3 && wrist3.y < shoulder3.y - 0.5
       return {
         name: 'Ball Toss',
         score: extended ? 92 : 82,
@@ -145,17 +139,16 @@ function analyzeBallToss(pose, servingArm) {
           ? 'Excellent ball toss — arm fully extended above head height for a clean release'
           : 'Good toss height — wrist is above head level'],
       }
-    } else if (tossingWrist.y < nose.y + 0.2 * T) {
+    } else if (wrist3.y < nose3.y + 0.2) {
       return { name: 'Ball Toss', score: 65, status: 'needs_work', feedback: ['Toss height is borderline — aim to release with your arm fully extended above your head for more control'] }
     }
     return { name: 'Ball Toss', score: 42, status: 'poor', feedback: ['Toss appears low — extend your arm completely and release the ball at the peak of your reach to give yourself time to prepare'] }
   }
 
-  // No head reference — fall back to judging the wrist against the shoulder
-  if (tossShoulder) {
-    if (tossingWrist.y < tossShoulder.y - 0.3 * T) {
+  if (shoulder3) {
+    if (wrist3.y < shoulder3.y - 0.3) {
       return { name: 'Ball Toss', score: 80, status: 'good', feedback: ['Good toss height — tossing arm is well raised above the shoulder'] }
-    } else if (tossingWrist.y < tossShoulder.y) {
+    } else if (wrist3.y < shoulder3.y) {
       return { name: 'Ball Toss', score: 62, status: 'needs_work', feedback: ['Tossing arm is only slightly raised — extend it fully above your head for a higher, more controlled toss'] }
     }
     return { name: 'Ball Toss', score: 45, status: 'poor', feedback: ['Tossing arm appears low — reach up and release the ball at full extension above your head'] }
@@ -164,37 +157,36 @@ function analyzeBallToss(pose, servingArm) {
   return uncertain('Ball Toss', 'Could not find a head or shoulder reference to judge toss height — try a clearer, well-lit recording')
 }
 
-function analyzeTrophyPosition(pose, servingArm) {
-  const T = bodyScale(pose)
-  const elbow = kp(pose, servingArm === 'right' ? KP.RIGHT_ELBOW : KP.LEFT_ELBOW)
-  const shoulder = kp(pose, servingArm === 'right' ? KP.RIGHT_SHOULDER : KP.LEFT_SHOULDER)
-  const knee = kp(pose, servingArm === 'right' ? KP.RIGHT_KNEE : KP.LEFT_KNEE)
-  const hip = kp(pose, servingArm === 'right' ? KP.RIGHT_HIP : KP.LEFT_HIP)
-  const ankle = kp(pose, servingArm === 'right' ? KP.RIGHT_ANKLE : KP.LEFT_ANKLE)
+function analyzeTrophyPosition(pose, handedness) {
+  if (!pose) return uncertain('Trophy Position', 'Could not pinpoint the trophy frame in this clip')
 
-  if (!elbow || !shoulder) {
+  const isRight = handedness === 'right'
+  const elbow3 = kp3D(pose, isRight ? KP.RIGHT_ELBOW : KP.LEFT_ELBOW)
+  const shoulder3 = kp3D(pose, isRight ? KP.RIGHT_SHOULDER : KP.LEFT_SHOULDER)
+  const knee3 = kp3D(pose, isRight ? KP.RIGHT_KNEE : KP.LEFT_KNEE)
+  const hip3 = kp3D(pose, isRight ? KP.RIGHT_HIP : KP.LEFT_HIP)
+  const ankle3 = kp3D(pose, isRight ? KP.RIGHT_ANKLE : KP.LEFT_ANKLE)
+
+  if (!elbow3 || !shoulder3) {
     return uncertain('Trophy Position', 'Could not detect the serving arm in the trophy frame')
-  }
-  if (!T) {
-    return uncertain('Trophy Position', 'Detected the serving arm but could not gauge your body size')
   }
 
   const feedback = []
   let score = 70
 
-  // Racket elbow vs shoulder (lower y = higher in frame)
-  if (elbow.y < shoulder.y) {
+  // Racket elbow vs shoulder (smaller y = higher in space)
+  if (elbow3.y < shoulder3.y) {
     score += 15
     feedback.push('Good racket arm position — elbow is above shoulder level, creating the classic trophy shape')
-  } else if (elbow.y < shoulder.y + 0.1 * T) {
+  } else if (elbow3.y < shoulder3.y + 0.1) {
     feedback.push('Racket elbow is close to shoulder height — try to raise it slightly higher for a better trophy position')
   } else {
     score -= 15
     feedback.push('Racket elbow appears below shoulder level — raise your elbow to at least shoulder height to form the trophy position')
   }
 
-  // Knee bend measured by the hip–knee–ankle angle (180° = straight legs).
-  const kneeAngle = jointAngle(hip, knee, ankle)
+  // Knee bend (hip–knee–ankle angle; 180° = straight, ~150° = good bend)
+  const kneeAngle = jointAngle3D(hip3, knee3, ankle3)
   if (kneeAngle !== null) {
     if (kneeAngle < 150) {
       score += 10
@@ -207,33 +199,29 @@ function analyzeTrophyPosition(pose, servingArm) {
     }
   }
 
-  score = Math.min(100, Math.max(0, score))
+  score = clamp(score, 0, 100)
   return { name: 'Trophy Position', score, status: status(score), feedback }
 }
 
-function analyzeContact(pose, servingArm) {
-  const T = bodyScale(pose)
-  const wrist = kp(pose, servingArm === 'right' ? KP.RIGHT_WRIST : KP.LEFT_WRIST)
-  const elbow = kp(pose, servingArm === 'right' ? KP.RIGHT_ELBOW : KP.LEFT_ELBOW)
-  const shoulder = kp(pose, servingArm === 'right' ? KP.RIGHT_SHOULDER : KP.LEFT_SHOULDER)
-  const nose = kp(pose, KP.NOSE)
+function analyzeContact(pose, handedness) {
+  if (!pose) return uncertain('Contact Point', 'Could not pinpoint the contact frame in this clip')
 
-  if (!wrist) {
-    return uncertain('Contact Point', 'Could not detect the racket hand at the contact frame')
-  }
-  if (!T) {
-    return uncertain('Contact Point', 'Detected the racket hand but could not gauge your body size')
-  }
+  const isRight = handedness === 'right'
+  const wrist3 = kp3D(pose, isRight ? KP.RIGHT_WRIST : KP.LEFT_WRIST)
+  const elbow3 = kp3D(pose, isRight ? KP.RIGHT_ELBOW : KP.LEFT_ELBOW)
+  const shoulder3 = kp3D(pose, isRight ? KP.RIGHT_SHOULDER : KP.LEFT_SHOULDER)
+  const nose3 = kp3D(pose, KP.NOSE)
+
+  if (!wrist3) return uncertain('Contact Point', 'Could not detect the racket hand at the contact frame')
 
   const feedback = []
   let score = 65
 
-  // Contact height — should be above the head
-  if (nose) {
-    if (wrist.y < nose.y - 0.05 * T) {
+  if (nose3) {
+    if (wrist3.y < nose3.y - 0.05) {
       score += 18
       feedback.push('Good contact height — racket is making contact above head level')
-    } else if (wrist.y < nose.y + 0.15 * T) {
+    } else if (wrist3.y < nose3.y + 0.15) {
       feedback.push('Contact height is near head level — aim to reach higher for more power and a better angle over the net')
     } else {
       score -= 15
@@ -243,8 +231,7 @@ function analyzeContact(pose, servingArm) {
     feedback.push('Could not find a head reference to judge contact height — scored on arm extension only')
   }
 
-  // Arm extension at contact (shoulder–elbow–wrist angle)
-  const angle = jointAngle(shoulder, elbow, wrist)
+  const angle = jointAngle3D(shoulder3, elbow3, wrist3)
   if (angle !== null) {
     if (angle > 155) {
       score += 15
@@ -258,29 +245,31 @@ function analyzeContact(pose, servingArm) {
     }
   }
 
-  score = Math.min(100, Math.max(0, score))
+  score = clamp(score, 0, 100)
   return { name: 'Contact Point', score, status: status(score), feedback }
 }
 
-function analyzeFollowThrough(pose, servingArm) {
-  const T = bodyScale(pose)
-  const wrist = kp(pose, servingArm === 'right' ? KP.RIGHT_WRIST : KP.LEFT_WRIST)
-  const hip = kp(pose, servingArm === 'right' ? KP.RIGHT_HIP : KP.LEFT_HIP)
-  const oppHip = kp(pose, servingArm === 'right' ? KP.LEFT_HIP : KP.RIGHT_HIP)
+function analyzeFollowThrough(pose, handedness) {
+  if (!pose) return uncertain('Follow-Through', 'Could not pinpoint the follow-through frame in this clip')
 
-  if (!wrist) {
-    return uncertain('Follow-Through', 'Could not detect the follow-through position clearly')
-  }
+  const isRight = handedness === 'right'
+  // Cross-body proximity is most natural in 2D image space (it's about how far
+  // across the BODY the racket has swung), so use 2D here.
+  const wrist2 = kp2D(pose, isRight ? KP.RIGHT_WRIST : KP.LEFT_WRIST)
+  const hip2 = kp2D(pose, isRight ? KP.RIGHT_HIP : KP.LEFT_HIP)
+  const oppHip2 = kp2D(pose, isRight ? KP.LEFT_HIP : KP.RIGHT_HIP)
 
-  if (hip && oppHip && T) {
-    const midX = (hip.x + oppHip.x) / 2
-    // Serving arm should cross to the opposite side of the body
-    const crossed = servingArm === 'right' ? wrist.x < midX : wrist.x > midX
-    const distFromMid = Math.abs(wrist.x - midX)
+  if (!wrist2) return uncertain('Follow-Through', 'Could not detect the follow-through position clearly')
+
+  if (hip2 && oppHip2) {
+    const midX = (hip2.x + oppHip2.x) / 2
+    const hipWidth = Math.abs(hip2.x - oppHip2.x) || 1
+    const crossed = isRight ? wrist2.x < midX : wrist2.x > midX
+    const distFromMid = Math.abs(wrist2.x - midX)
 
     if (crossed) {
       return { name: 'Follow-Through', score: 90, status: 'good', feedback: ['Complete follow-through — racket arm has crossed the body correctly, promoting spin and control'] }
-    } else if (distFromMid < 0.25 * T) {
+    } else if (distFromMid < hipWidth * 0.5) {
       return { name: 'Follow-Through', score: 68, status: 'needs_work', feedback: ['Follow-through almost complete — let the racket continue swinging fully across your body to the opposite hip'] }
     }
     return { name: 'Follow-Through', score: 48, status: 'poor', feedback: ['Incomplete follow-through — allow the racket to swing naturally all the way across your body. Stopping early reduces spin and increases injury risk'] }
@@ -289,28 +278,135 @@ function analyzeFollowThrough(pose, servingArm) {
   return { name: 'Follow-Through', score: 65, status: 'needs_work', feedback: ['Follow-through detected — ensure the racket swings completely across your body toward the opposite hip for maximum spin and safety'] }
 }
 
-export function analyzeServe(poses) {
-  if (!poses || poses.every(p => !p)) {
+// ----------------------------------------------------------------------------
+// Composite scoring: 40% angles, 30% tempo, 30% penalties.
+// Pattern from yakupzengin/fitness-trainer-pose-estimation (MIT).
+// ----------------------------------------------------------------------------
+
+// Score in [0, 100] from how well the elapsed time between two phases matches
+// a target range. Inside the range scores 100; symmetric Gaussian-ish falloff
+// outside.
+function tempoScore(elapsed, idealMin, idealMax, falloff) {
+  if (elapsed == null) return null
+  if (elapsed >= idealMin && elapsed <= idealMax) return 100
+  const dist = elapsed < idealMin ? idealMin - elapsed : elapsed - idealMax
+  const k = dist / falloff
+  return clamp(Math.round(100 * Math.exp(-k * k)), 0, 100)
+}
+
+function computeTempo(phases) {
+  // Index into `phases` array: 0=stance, 1=toss, 2=trophy, 3=contact, 4=followT
+  const ts = phases.map(p => p.frame ? p.frame.timestamp : null)
+  const tossToTrophy = ts[1] != null && ts[2] != null ? ts[2] - ts[1] : null
+  const trophyToContact = ts[2] != null && ts[3] != null ? ts[3] - ts[2] : null
+  const contactToFollow = ts[3] != null && ts[4] != null ? ts[4] - ts[3] : null
+
+  // Pro serve tempos (seconds, approximate biomechanical norms):
+  //  - toss release → trophy: 0.4–0.7s
+  //  - trophy → contact: 0.15–0.3s (the explosive whip)
+  //  - contact → follow-through: 0.15–0.3s
+  const s1 = tempoScore(tossToTrophy, 0.4, 0.7, 0.3)
+  const s2 = tempoScore(trophyToContact, 0.15, 0.3, 0.15)
+  const s3 = tempoScore(contactToFollow, 0.15, 0.3, 0.15)
+
+  const parts = [s1, s2, s3].filter(s => s != null)
+  if (parts.length === 0) return { score: 70, breakdown: { tossToTrophy, trophyToContact, contactToFollow } }
+  const avg = parts.reduce((a, b) => a + b, 0) / parts.length
+  return {
+    score: Math.round(avg),
+    breakdown: { tossToTrophy, trophyToContact, contactToFollow },
+  }
+}
+
+// Aggregate per-phase scores into the 3 buckets. We reuse the same per-phase
+// rule outputs for the angles bucket and apply explicit penalty deductions.
+function computeAngles(phaseResults) {
+  // Angles bucket = average of trophy + contact + ball toss scores (the
+  // phases that are most directly about joint angles / arm geometry).
+  const indices = [1, 2, 3] // toss, trophy, contact
+  const scores = indices.map(i => phaseResults[i].score)
+  const avg = scores.reduce((a, b) => a + b, 0) / scores.length
+  return Math.round(avg)
+}
+
+function computePenalties(phaseResults) {
+  // Start at 100, deduct for each known fault.
+  let score = 100
+  const reasons = []
+  for (const phase of phaseResults) {
+    if (phase.status === 'poor') {
+      score -= 18
+      reasons.push(`${phase.name} flagged as needs improvement`)
+    } else if (phase.status === 'needs_work') {
+      score -= 8
+    } else if (phase.status === 'uncertain') {
+      score -= 5
+      reasons.push(`${phase.name} could not be measured`)
+    }
+  }
+  return { score: clamp(score, 0, 100), reasons }
+}
+
+// ----------------------------------------------------------------------------
+// Public API
+// ----------------------------------------------------------------------------
+
+// Input: { phases, handedness, handednessConfidence }
+//   phases: output of detectPhases — array of 5 { name, pose, frame, index }
+//   handedness: 'right' | 'left'
+//   handednessConfidence: number in [0,1] from handednessDetector (optional)
+//
+// Output: { overallScore, servingArm, phases, composite, handednessConfidence }
+//   composite is the per-bucket breakdown; the UI can display it optionally.
+export function analyzeServe({ phases, handedness, handednessConfidence }) {
+  if (!phases || phases.length !== 5) {
     return {
       overallScore: 0,
-      servingArm: 'right',
-      warning: 'No body detected in any frame. Make sure your full body is clearly visible in the video.',
+      servingArm: handedness || 'right',
+      warning: 'Phase detection failed — make sure your full body is visible throughout the serve',
       phases: [],
+      composite: null,
+      handednessConfidence: handednessConfidence ?? 0,
     }
   }
 
-  const servingArm = detectServingArm(poses)
+  if (phases.every(p => !p.pose)) {
+    return {
+      overallScore: 0,
+      servingArm: handedness || 'right',
+      warning: 'No body detected in any frame. Make sure your full body is clearly visible in the video.',
+      phases: [],
+      composite: null,
+      handednessConfidence: handednessConfidence ?? 0,
+    }
+  }
 
-  const phases = [
-    analyzeStance(poses[0], servingArm),
-    analyzeBallToss(poses[1], servingArm),
-    analyzeTrophyPosition(poses[2], servingArm),
-    analyzeContact(poses[4], servingArm),
-    analyzeFollowThrough(poses[5], servingArm),
+  const hand = handedness || 'right'
+  const phaseResults = [
+    analyzeStance(phases[0].pose, hand),
+    analyzeBallToss(phases[1].pose, hand),
+    analyzeTrophyPosition(phases[2].pose, hand),
+    analyzeContact(phases[3].pose, hand),
+    analyzeFollowThrough(phases[4].pose, hand),
   ]
 
-  const scores = phases.map(p => p.score)
-  const overallScore = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+  const anglesScore = computeAngles(phaseResults)
+  const { score: tempoBucketScore, breakdown: tempoBreakdown } = computeTempo(phases)
+  const { score: penaltiesScore, reasons: penaltyReasons } = computePenalties(phaseResults)
 
-  return { overallScore, servingArm, phases }
+  const overallScore = Math.round(0.4 * anglesScore + 0.3 * tempoBucketScore + 0.3 * penaltiesScore)
+
+  return {
+    overallScore,
+    servingArm: hand,
+    handednessConfidence: handednessConfidence ?? 1,
+    phases: phaseResults,
+    composite: {
+      angles: anglesScore,
+      tempo: tempoBucketScore,
+      tempoBreakdown,
+      penalties: penaltiesScore,
+      penaltyReasons,
+    },
+  }
 }

@@ -4,23 +4,32 @@ import AnalysisProgress from './components/AnalysisProgress'
 import FrameGallery from './components/FrameGallery'
 import ScoreCard from './components/ScoreCard'
 import PhaseAnalysis from './components/PhaseAnalysis'
-import { extractFrames } from './utils/videoProcessor'
+import HandednessPrompt from './components/HandednessPrompt'
+import { extractFrames, frameToDataUrl } from './utils/videoProcessor'
 import { loadModel, detectPoseFromCanvas } from './utils/poseDetector'
+import { smoothPoseSequence } from './utils/temporalSmoother'
+import { detectHandedness } from './utils/handednessDetector'
+import { detectPhases } from './utils/phaseDetector'
 import { analyzeServe } from './utils/serveAnalyzer'
 
+const HANDEDNESS_CONFIDENCE_THRESHOLD = 0.3
+
 export default function App() {
-  const [status, setStatus] = useState('idle')       // idle | analyzing | results | error
+  const [status, setStatus] = useState('idle')       // idle | analyzing | needs_handedness | results | error
   const [videoFile, setVideoFile] = useState(null)
   const [videoUrl, setVideoUrl] = useState(null)
-  const [frames, setFrames] = useState([])            // display data (no canvas)
-  const [poses, setPoses] = useState([])
+  const [displayFrames, setDisplayFrames] = useState([])
+  const [displayPoses, setDisplayPoses] = useState([])
   const [analysis, setAnalysis] = useState(null)
   const [progress, setProgress] = useState({ step: 0, message: 'Starting...' })
   const [errorMsg, setErrorMsg] = useState('')
 
-  // Keep canvas references separate from React state to avoid serialization issues
-  const canvasesRef = useRef([])
-  // Set when the user cancels; checked between async steps to abort early.
+  // Handedness uncertainty state — set when the detector confidence is below
+  // the threshold and the user needs to confirm before scoring proceeds.
+  const [pendingHandedness, setPendingHandedness] = useState(null) // { hand, confidence }
+  // Cached intermediates so the user's handedness choice can be applied
+  // without re-running pose detection.
+  const cachedRef = useRef(null)
   const cancelRef = useRef(false)
 
   function handleVideoSelect(file) {
@@ -28,11 +37,12 @@ export default function App() {
     if (videoUrl) URL.revokeObjectURL(videoUrl)
     setVideoUrl(URL.createObjectURL(file))
     setStatus('idle')
-    setFrames([])
-    setPoses([])
+    setDisplayFrames([])
+    setDisplayPoses([])
     setAnalysis(null)
     setErrorMsg('')
-    canvasesRef.current = []
+    setPendingHandedness(null)
+    cachedRef.current = null
   }
 
   async function runAnalysis() {
@@ -42,36 +52,49 @@ export default function App() {
     setErrorMsg('')
 
     try {
-      // Step 1 — extract frames
-      setProgress({ step: 0, message: 'Extracting key frames from video...' })
-      const extracted = await extractFrames(videoFile)
+      // Step 1 — dense frame extraction (10 FPS)
+      setProgress({ step: 0, message: 'Extracting frames from video...' })
+      const frames = await extractFrames(videoFile, (i, total) => {
+        setProgress({ step: 0, message: `Extracting frames — ${i} of ${total}` })
+      })
       if (cancelRef.current) return
 
-      canvasesRef.current = extracted.map(f => f.canvas)
-      // Store display-only data in state (canvas excluded to keep state serializable)
-      setFrames(extracted.map(({ canvas: _c, ...rest }) => rest))
-
       // Step 2 — load model
-      setProgress({ step: 1, message: 'Loading AI model (first run may take ~15 s)...' })
+      setProgress({ step: 1, message: 'Loading BlazePose model (first run may take ~15 s)...' })
       await loadModel()
       if (cancelRef.current) return
 
-      // Step 3 — detect poses frame by frame
-      const detected = []
-      for (let i = 0; i < canvasesRef.current.length; i++) {
-        setProgress({ step: 1, message: `Detecting pose — frame ${i + 1} of ${canvasesRef.current.length}` })
-        const pose = await detectPoseFromCanvas(canvasesRef.current[i])
+      // Step 3 — pose detect every frame
+      const rawPoses = []
+      for (let i = 0; i < frames.length; i++) {
+        setProgress({ step: 1, message: `Detecting pose — frame ${i + 1} of ${frames.length}` })
+        const pose = await detectPoseFromCanvas(frames[i].canvas)
         if (cancelRef.current) return
-        detected.push(pose)
+        rawPoses.push(pose)
       }
-      setPoses(detected)
 
-      // Step 4 — biomechanical analysis
-      setProgress({ step: 2, message: 'Scoring your serve technique...' })
-      const result = analyzeServe(detected)
-      setAnalysis(result)
+      // Step 4 — temporal smoothing
+      setProgress({ step: 2, message: 'Smoothing keypoint trajectories...' })
+      const smoothedPoses = smoothPoseSequence(rawPoses, frames)
 
-      setStatus('results')
+      // Step 5 — handedness detection
+      const handednessResult = detectHandedness(smoothedPoses, frames)
+      console.debug('Handedness detection:', handednessResult)
+
+      // Cache so the user's handedness confirmation (if needed) can finish
+      // analysis without re-running everything.
+      cachedRef.current = { frames, smoothedPoses, handednessResult }
+
+      if (handednessResult.confidence < HANDEDNESS_CONFIDENCE_THRESHOLD) {
+        setPendingHandedness({
+          hand: handednessResult.hand,
+          confidence: handednessResult.confidence,
+        })
+        setStatus('needs_handedness')
+        return
+      }
+
+      finishAnalysis(handednessResult.hand, handednessResult.confidence)
     } catch (err) {
       if (cancelRef.current) return
       console.error('Analysis error:', err)
@@ -80,12 +103,49 @@ export default function App() {
     }
   }
 
+  // Phase detection + scoring. Called either directly from runAnalysis or
+  // after the user confirms handedness via the modal.
+  function finishAnalysis(handedness, handednessConfidence) {
+    const cached = cachedRef.current
+    if (!cached) return
+    const { frames, smoothedPoses } = cached
+
+    setStatus('analyzing')
+    setProgress({ step: 2, message: 'Detecting serve phases...' })
+
+    const phases = detectPhases(smoothedPoses, frames, handedness)
+    const result = analyzeServe({ phases, handedness, handednessConfidence })
+
+    // Build display data for the 5 phase frames only (skip the bulk).
+    const displayFrames = phases.map((p, i) => {
+      if (!p.frame) return { label: p.name, dataUrl: null, width: 0, height: 0 }
+      return {
+        label: p.name,
+        dataUrl: frameToDataUrl(p.frame),
+        timestamp: p.frame.timestamp,
+        width: p.frame.width,
+        height: p.frame.height,
+      }
+    })
+
+    setDisplayFrames(displayFrames)
+    setDisplayPoses(phases.map(p => p.pose))
+    setAnalysis(result)
+    setPendingHandedness(null)
+    setStatus('results')
+  }
+
+  function onConfirmHandedness(hand) {
+    finishAnalysis(hand, cachedRef.current.handednessResult.confidence)
+  }
+
   function cancelAnalysis() {
     cancelRef.current = true
-    setFrames([])
-    setPoses([])
+    setDisplayFrames([])
+    setDisplayPoses([])
     setAnalysis(null)
-    canvasesRef.current = []
+    setPendingHandedness(null)
+    cachedRef.current = null
     setStatus('idle')
   }
 
@@ -93,23 +153,23 @@ export default function App() {
     if (videoUrl) URL.revokeObjectURL(videoUrl)
     setVideoFile(null)
     setVideoUrl(null)
-    setFrames([])
-    setPoses([])
+    setDisplayFrames([])
+    setDisplayPoses([])
     setAnalysis(null)
-    canvasesRef.current = []
+    setPendingHandedness(null)
+    cachedRef.current = null
     setStatus('idle')
   }
 
   return (
     <div className="min-h-screen bg-gray-950">
-      {/* Header */}
       <header className="bg-gray-900 border-b border-gray-800">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <span className="text-2xl select-none">🎾</span>
             <div>
               <h1 className="text-lg font-bold text-white leading-none">Tennis Serve Analyzer</h1>
-              <p className="text-xs text-gray-500 mt-0.5">AI-powered form analysis</p>
+              <p className="text-xs text-gray-500 mt-0.5">AI-powered form analysis · BlazePose 3D</p>
             </div>
           </div>
           {status === 'results' && (
@@ -123,7 +183,6 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main content */}
       <main className="max-w-5xl mx-auto px-6 py-8">
         {status === 'idle' && (
           <VideoUpload
@@ -154,12 +213,20 @@ export default function App() {
 
         {status === 'results' && analysis && (
           <div className="space-y-8">
-            <FrameGallery frames={frames} poses={poses} />
+            <FrameGallery frames={displayFrames} poses={displayPoses} />
             <ScoreCard analysis={analysis} />
             <PhaseAnalysis phases={analysis.phases} />
           </div>
         )}
       </main>
+
+      {status === 'needs_handedness' && pendingHandedness && (
+        <HandednessPrompt
+          detectedHand={pendingHandedness.hand}
+          confidence={pendingHandedness.confidence}
+          onConfirm={onConfirmHandedness}
+        />
+      )}
     </div>
   )
 }

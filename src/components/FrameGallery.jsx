@@ -3,6 +3,18 @@ import { drawSkeleton } from '../utils/poseDetector'
 
 const DISPLAY_WIDTH = 280
 
+// BlazePose returns 33 keypoints; use a fraction (rather than the old fixed
+// counts tuned for MoveNet's 17) so the quality label scales correctly.
+function qualityFromPose(pose) {
+  if (!pose || !pose.keypoints) return { label: 'None', color: 'text-red-400' }
+  const total = pose.keypoints.length
+  const visible = pose.keypoints.filter(k => k.score > 0.5).length
+  const ratio = visible / total
+  if (ratio >= 0.7) return { label: 'High',   color: 'text-green-400' }
+  if (ratio >= 0.4) return { label: 'Medium', color: 'text-yellow-400' }
+  return { label: 'Low', color: 'text-red-400' }
+}
+
 function FrameCard({ frame, pose, index }) {
   const canvasRef = useRef(null)
 
@@ -15,8 +27,6 @@ function FrameCard({ frame, pose, index }) {
     const img = new Image()
 
     img.onload = () => {
-      // A re-render (new frame/pose) or unmount may have happened while the
-      // image decoded — bail so we don't paint stale data on the canvas.
       if (cancelled) return
 
       const aspectRatio = img.height / img.width
@@ -37,11 +47,23 @@ function FrameCard({ frame, pose, index }) {
     return () => { cancelled = true }
   }, [frame?.dataUrl, pose])
 
-  const confidence = pose
-    ? pose.keypoints.filter(k => k.score > 0.25).length
-    : 0
-  const qualityLabel = confidence >= 12 ? 'High' : confidence >= 7 ? 'Medium' : pose ? 'Low' : 'None'
-  const qualityColor = confidence >= 12 ? 'text-green-400' : confidence >= 7 ? 'text-yellow-400' : 'text-red-400'
+  const { label, color } = qualityFromPose(pose)
+
+  // No frame for this phase — the detector couldn't pick one. Render a
+  // placeholder so the gallery still shows all 5 phase slots.
+  if (!frame?.dataUrl) {
+    return (
+      <div className="flex flex-col gap-2">
+        <div className="relative bg-gray-900 rounded-lg overflow-hidden border border-gray-700 aspect-video flex items-center justify-center">
+          <span className="text-gray-600 text-xs">Not detected</span>
+        </div>
+        <div className="text-center">
+          <p className="text-xs font-medium text-white">{frame?.label || `Phase ${index + 1}`}</p>
+          <p className="text-xs text-red-400">No frame</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col gap-2">
@@ -58,7 +80,7 @@ function FrameCard({ frame, pose, index }) {
       </div>
       <div className="text-center">
         <p className="text-xs font-medium text-white">{frame.label}</p>
-        <p className={`text-xs ${qualityColor}`}>Pose: {qualityLabel}</p>
+        <p className={`text-xs ${color}`}>Pose: {label}</p>
       </div>
     </div>
   )
@@ -70,10 +92,10 @@ export default function FrameGallery({ frames, poses }) {
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold text-white">Analyzed Frames</h2>
-        <span className="text-xs text-gray-500">Pose skeleton overlaid on each frame</span>
+        <h2 className="text-lg font-semibold text-white">Analyzed Phase Frames</h2>
+        <span className="text-xs text-gray-500">Dynamically picked from the serve motion</span>
       </div>
-      <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
         {frames.map((frame, i) => (
           <FrameCard key={i} frame={frame} pose={poses[i]} index={i} />
         ))}

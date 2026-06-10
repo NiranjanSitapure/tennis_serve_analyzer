@@ -108,7 +108,7 @@ export default function VideoUpload({ onVideoSelect, videoFile, videoUrl, onAnal
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-12">
         {[
           { icon: '🔒', title: 'Fully Private', desc: 'Video never leaves your browser — all analysis runs locally on your device' },
-          { icon: '🤖', title: 'AI Pose Detection', desc: 'TensorFlow MoveNet detects 17 body keypoints across 6 key frames of your serve' },
+          { icon: '🤖', title: 'AI Pose Detection', desc: 'BlazePose 3D tracks 33 body landmarks across every frame, with temporal smoothing' },
           { icon: '🎯', title: '5 Phases Scored', desc: 'Stance, ball toss, trophy position, contact point, and follow-through' },
         ].map(({ icon, title, desc }) => (
           <div key={title} className="bg-gray-900 rounded-xl p-5 border border-gray-800">

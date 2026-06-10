@@ -1,10 +1,29 @@
-const PHASE_LABELS = ['Stance', 'Ball Toss', 'Trophy Position', 'Backswing', 'Contact', 'Follow-Through']
-const TIMESTAMPS = [0.10, 0.25, 0.40, 0.55, 0.70, 0.85]
+const TARGET_FPS = 10        // sample rate across the whole clip
+const MIN_FRAMES = 8         // never extract fewer than this
+const MAX_FRAMES = 60        // cap to bound analysis time on long clips
 
 const LOAD_TIMEOUT_MS = 30000
 const SEEK_TIMEOUT_MS = 10000
 
-export function extractFrames(videoFile) {
+// Build the sample timestamps. Walk the clip end-to-end at ~10 FPS, but if the
+// clip is short (<1.5s) fall back to MIN_FRAMES uniformly spaced; if it's long
+// (>6s) cap at MAX_FRAMES still uniformly spaced. Phase detection picks the 5
+// scoring frames from this dense sequence downstream.
+function buildTimestamps(duration) {
+  const naiveCount = Math.round(duration * TARGET_FPS)
+  const count = Math.min(MAX_FRAMES, Math.max(MIN_FRAMES, naiveCount))
+  const stamps = []
+  // Sample uniformly in (0, duration), avoiding the very first/last 5%.
+  const start = duration * 0.05
+  const end = duration * 0.95
+  const span = end - start
+  for (let i = 0; i < count; i++) {
+    stamps.push(start + (span * i) / (count - 1))
+  }
+  return stamps
+}
+
+export function extractFrames(videoFile, onProgress) {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video')
     video.muted = true
@@ -42,24 +61,21 @@ export function extractFrames(videoFile) {
     video.addEventListener('error', () =>
       fail('Could not load video. Please try a different file format (MP4 recommended).'))
 
-    // Wait for loadeddata (not just loadedmetadata) so the first frame is decoded
-    // and videoWidth/videoHeight are reliable — Safari reports 0 at metadata time.
     video.addEventListener('loadeddata', async () => {
       try {
         const duration = video.duration
 
-        // Streams / corrupt files can report Infinity or NaN, which would slip
-        // past a plain `< 1` check and produce invalid seek targets.
         if (!isFinite(duration) || duration < 1) {
           fail('Video is too short or has no fixed length. Please upload a recorded clip of at least 1 second.')
           return
         }
 
+        const timestamps = buildTimestamps(duration)
         const frames = []
 
-        for (let i = 0; i < TIMESTAMPS.length; i++) {
+        for (let i = 0; i < timestamps.length; i++) {
           if (settled) return
-          await seekTo(video, TIMESTAMPS[i] * duration)
+          await seekTo(video, timestamps[i])
           await waitForFrame(video)
 
           const width = video.videoWidth || 640
@@ -72,12 +88,14 @@ export function extractFrames(videoFile) {
 
           frames.push({
             canvas,
-            dataUrl: canvas.toDataURL('image/jpeg', 0.85),
-            timestamp: TIMESTAMPS[i] * duration,
-            label: PHASE_LABELS[i],
+            // dataUrl is only generated for the 5 phase frames downstream (much
+            // cheaper); skip the JPEG encode here for the bulk frames.
+            timestamp: timestamps[i],
             width,
             height,
           })
+
+          if (onProgress) onProgress(i + 1, timestamps.length)
         }
 
         succeed(frames)
@@ -91,8 +109,13 @@ export function extractFrames(videoFile) {
   })
 }
 
-// Seek and resolve once the frame at `time` is available, rejecting if the
-// browser never fires `seeked` (corrupt / non-seekable media).
+// Render a frame's canvas to a JPEG data URL. Called only for the 5 phase
+// frames after phase detection — encoding all ~30 frames is wasted work.
+export function frameToDataUrl(frame) {
+  if (!frame || !frame.canvas) return null
+  return frame.canvas.toDataURL('image/jpeg', 0.85)
+}
+
 function seekTo(video, time) {
   return new Promise((resolve, reject) => {
     let timer
@@ -110,8 +133,6 @@ function seekTo(video, time) {
   })
 }
 
-// Ensure a real frame is painted before we read pixels. requestVideoFrameCallback
-// is the precise signal where supported; otherwise fall back to the next paint.
 function waitForFrame(video) {
   return new Promise(resolve => {
     if (typeof video.requestVideoFrameCallback === 'function') {
