@@ -1,6 +1,7 @@
 const TARGET_FPS = 10        // sample rate across the whole clip
 const MIN_FRAMES = 8         // never extract fewer than this
-const MAX_FRAMES = 60        // cap to bound analysis time on long clips
+const MAX_FRAMES = 40        // cap to bound analysis time on long clips
+const EXTRACT_MAX_DIM = 512  // cap canvas size; BlazePose resizes to ~256px anyway
 
 const LOAD_TIMEOUT_MS = 30000
 const SEEK_TIMEOUT_MS = 10000
@@ -62,6 +63,9 @@ export function extractFrames(videoFile, onProgress) {
       fail('Could not load video. Please try a different file format (MP4 recommended).'))
 
     video.addEventListener('loadeddata', async () => {
+      // Timer's only job is catching videos that never load. Clear it now so
+      // it doesn't fire during extraction (seeks are guarded by their own 10s timeout).
+      clearTimeout(loadTimer)
       try {
         const duration = video.duration
 
@@ -78,8 +82,11 @@ export function extractFrames(videoFile, onProgress) {
           await seekTo(video, timestamps[i])
           await waitForFrame(video)
 
-          const width = video.videoWidth || 640
-          const height = video.videoHeight || 360
+          const rawW = video.videoWidth || 640
+          const rawH = video.videoHeight || 360
+          const scale = Math.min(1, EXTRACT_MAX_DIM / Math.max(rawW, rawH))
+          const width = Math.round(rawW * scale)
+          const height = Math.round(rawH * scale)
 
           const canvas = document.createElement('canvas')
           canvas.width = width
@@ -90,7 +97,7 @@ export function extractFrames(videoFile, onProgress) {
             canvas,
             // dataUrl is only generated for the 5 phase frames downstream (much
             // cheaper); skip the JPEG encode here for the bulk frames.
-            timestamp: timestamps[i],
+            timestamp: video.currentTime,
             width,
             height,
           })
@@ -129,7 +136,14 @@ function seekTo(video, time) {
       reject(new Error('Timed out seeking within the video — it may be corrupt or use an unsupported codec.'))
     }, SEEK_TIMEOUT_MS)
     video.addEventListener('seeked', onSeeked)
-    video.currentTime = time
+    // fastSeek jumps to the nearest keyframe — much faster on Safari/Firefox.
+    // We record video.currentTime after seeked fires, so the actual landed
+    // timestamp is used throughout; precision doesn't matter here.
+    if (typeof video.fastSeek === 'function') {
+      video.fastSeek(time)
+    } else {
+      video.currentTime = time
+    }
   })
 }
 
