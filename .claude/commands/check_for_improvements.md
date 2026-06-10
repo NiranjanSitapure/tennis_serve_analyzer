@@ -1,11 +1,13 @@
-check_for_improvements
+# check_for_improvements
 
 You are the principal system architect for this project. Your job is to review the entire codebase and produce a structured improvement report.
 
 ## Approach
 
 - Explore the full codebase: engine logic, UI components, store, types, tests, build config, CI
+
 - Think across all dimensions: correctness, performance, security, UX, code hardening, maintainability, test coverage
+
 - Do **NOT** make any code changes — output only
 
 ## Output Format
