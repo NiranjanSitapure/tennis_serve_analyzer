@@ -33,8 +33,30 @@ function CircularScore({ score }) {
   )
 }
 
+function CompositeBar({ label, score, weight, hint }) {
+  const color =
+    score >= 78 ? 'bg-green-500'
+    : score >= 55 ? 'bg-yellow-500'
+    : 'bg-red-500'
+  return (
+    <div className="flex items-center gap-3">
+      <div className="w-32 shrink-0">
+        <p className="text-sm text-gray-300">{label}</p>
+        <p className="text-xs text-gray-500">{weight}% of total · {hint}</p>
+      </div>
+      <div className="flex-1 bg-gray-700 rounded-full h-2.5">
+        <div
+          className={`h-2.5 rounded-full ${color} transition-all duration-1000`}
+          style={{ width: `${score}%` }}
+        />
+      </div>
+      <span className="text-sm font-bold text-white w-8 text-right">{score}</span>
+    </div>
+  )
+}
+
 export default function ScoreCard({ analysis }) {
-  const { overallScore, phases, servingArm, warning } = analysis
+  const { overallScore, phases, servingArm, warning, composite, handednessConfidence } = analysis
 
   return (
     <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
@@ -52,6 +74,9 @@ export default function ScoreCard({ analysis }) {
         <div className="flex-1 space-y-4 w-full">
           <p className="text-xs text-gray-400 uppercase tracking-wide mb-3">
             Detected: {servingArm}-handed serve
+            {handednessConfidence != null && (
+              <span className="text-gray-600"> · confidence {Math.round(handednessConfidence * 100)}%</span>
+            )}
           </p>
           {phases.map(phase => {
             const barColor =
@@ -73,6 +98,15 @@ export default function ScoreCard({ analysis }) {
           })}
         </div>
       </div>
+
+      {composite && (
+        <div className="mt-8 pt-6 border-t border-gray-800 space-y-3">
+          <h3 className="text-xs text-gray-400 uppercase tracking-wide mb-3">Score Breakdown</h3>
+          <CompositeBar label="Joint Angles" score={composite.angles} weight={40} hint="elbow, knee, contact" />
+          <CompositeBar label="Tempo" score={composite.tempo} weight={30} hint="timing between phases" />
+          <CompositeBar label="Penalties" score={composite.penalties} weight={30} hint="missed elements" />
+        </div>
+      )}
     </div>
   )
 }

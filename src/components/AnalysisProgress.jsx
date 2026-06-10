@@ -1,7 +1,7 @@
 const STEPS = [
-  { label: 'Extracting frames', desc: 'Capturing 6 key moments from your video' },
-  { label: 'Detecting pose', desc: 'AI locating body keypoints in each frame' },
-  { label: 'Analyzing form', desc: 'Scoring each phase of your serve technique' },
+  { label: 'Extracting frames', desc: 'Sampling your video at 10 FPS' },
+  { label: 'Detecting pose', desc: 'BlazePose locating 33 body landmarks in each frame' },
+  { label: 'Analyzing form', desc: 'Smoothing trajectories, finding phases, scoring technique' },
 ]
 
 export default function AnalysisProgress({ progress, onCancel }) {
@@ -42,7 +42,7 @@ export default function AnalysisProgress({ progress, onCancel }) {
       </div>
 
       <p className="text-gray-600 text-xs mt-10">
-        First run downloads the AI model (~5 MB) and may take 10–20 seconds
+        First run downloads the BlazePose model (~9 MB) and may take 15–30 seconds
       </p>
 
       {onCancel && (
