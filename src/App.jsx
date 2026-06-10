@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import VideoUpload from './components/VideoUpload'
 import AnalysisProgress from './components/AnalysisProgress'
 import FrameGallery from './components/FrameGallery'
@@ -15,6 +15,12 @@ import { analyzeServe } from './utils/serveAnalyzer'
 const HANDEDNESS_CONFIDENCE_THRESHOLD = 0.3
 
 export default function App() {
+  // Silently preload the BlazePose model as soon as the page mounts so it's
+  // already in memory (or downloading) by the time the user clicks Analyze.
+  useEffect(() => {
+    loadModel().catch(() => {})
+  }, [])
+
   const [status, setStatus] = useState('idle')       // idle | analyzing | needs_handedness | results | error
   const [videoFile, setVideoFile] = useState(null)
   const [videoUrl, setVideoUrl] = useState(null)
@@ -52,16 +58,21 @@ export default function App() {
     setErrorMsg('')
 
     try {
-      // Step 1 — dense frame extraction (10 FPS)
+      // Step 1 — dense frame extraction + model load in parallel.
+      // loadModel() was already fired on mount (preload); calling it again just
+      // returns the cached promise. Starting it here too means extraction and
+      // model download overlap even if the user clicked Analyze very quickly.
+      const modelLoadPromise = loadModel()
+
       setProgress({ step: 0, message: 'Extracting frames from video...' })
       const frames = await extractFrames(videoFile, (i, total) => {
         setProgress({ step: 0, message: `Extracting frames — ${i} of ${total}` })
       })
       if (cancelRef.current) return
 
-      // Step 2 — load model
-      setProgress({ step: 1, message: 'Loading BlazePose model (first run may take ~15 s)...' })
-      await loadModel()
+      // Step 2 — await model (likely already done since extraction takes longer)
+      setProgress({ step: 1, message: 'Loading pose detection model...' })
+      await modelLoadPromise
       if (cancelRef.current) return
 
       // Step 3 — pose detect every frame
@@ -169,7 +180,7 @@ export default function App() {
             <span className="text-2xl select-none">🎾</span>
             <div>
               <h1 className="text-lg font-bold text-white leading-none">Tennis Serve Analyzer</h1>
-              <p className="text-xs text-gray-500 mt-0.5">AI-powered form analysis · BlazePose 3D</p>
+              <p className="text-xs text-gray-500 mt-0.5">AI-powered form analysis</p>
             </div>
           </div>
           {status === 'results' && (
