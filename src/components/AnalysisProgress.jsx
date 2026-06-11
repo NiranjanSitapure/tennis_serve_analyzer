@@ -41,10 +41,6 @@ export default function AnalysisProgress({ progress, onCancel }) {
         })}
       </div>
 
-      <p className="text-gray-600 text-xs mt-10">
-        First run downloads the BlazePose model (~9 MB) and may take 15–30 seconds
-      </p>
-
       {onCancel && (
         <button
           onClick={onCancel}
