@@ -16,20 +16,17 @@
 // Returns: { hand: 'right' | 'left', confidence: number, signals: {...} }
 // `confidence` is in [0, 1]; the UI shows a manual prompt below 0.3.
 
-// BlazePose landmark indices used by the fusion.
-const LEFT_SHOULDER = 11
-const RIGHT_SHOULDER = 12
-const LEFT_ELBOW = 13
-const RIGHT_ELBOW = 14
-const LEFT_WRIST = 15
-const RIGHT_WRIST = 16
-const LEFT_HIP = 23
-const RIGHT_HIP = 24
+// MoveNet 17-keypoint COCO indices.
+const LEFT_SHOULDER = 5
+const RIGHT_SHOULDER = 6
+const LEFT_ELBOW = 7
+const RIGHT_ELBOW = 8
+const LEFT_WRIST = 9
+const RIGHT_WRIST = 10
+const LEFT_HIP = 11
+const RIGHT_HIP = 12
 
-// BlazePose visibility scores tend to be high (>0.8) for the serving / tossing
-// arm in any decent recording. 0.5 gates out fully occluded joints without
-// being so strict it discards a usable signal.
-const KP_MIN_SCORE = 0.5
+const KP_MIN_SCORE = 0.3
 
 function pt(pose, idx) {
   if (!pose || !pose.keypoints) return null
